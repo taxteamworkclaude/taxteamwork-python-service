@@ -198,6 +198,14 @@ def health():
     return jsonify({"status": "ok", "service": "taxteamwork-python-service"})
 
 
+def _get_access_token(data: Dict[str, Any]) -> str | None:
+    """Read access token from Authorization header (Bearer) or body."""
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return data.get("accessToken")
+
+
 @app.post("/extract")
 def extract_endpoint():
     """
@@ -205,8 +213,11 @@ def extract_endpoint():
         {
           "fileId":      "<Drive file ID of the archive>",
           "folderId":    "<Drive folder ID to upload extracted files into>",
-          "accessToken": "<Google OAuth access token, scope drive>"
+          "accessToken": "<optional if Authorization: Bearer header provided>"
         }
+
+    Auth: prefer Authorization: Bearer <token> header (sent by n8n
+    Predefined Credential Type). Falls back to body.accessToken.
 
     Response:
         {
@@ -221,10 +232,10 @@ def extract_endpoint():
     data = request.get_json(force=True, silent=True) or {}
     file_id = data.get("fileId")
     folder_id = data.get("folderId")
-    access_token = data.get("accessToken")
+    access_token = _get_access_token(data)
 
     if not (file_id and folder_id and access_token):
-        return jsonify({"ok": False, "error": "fileId, folderId, accessToken required"}), 400
+        return jsonify({"ok": False, "error": "fileId, folderId, and access token (header or body) required"}), 400
 
     try:
         log.info("Extract request fileId=%s folderId=%s", file_id, folder_id)
@@ -286,10 +297,10 @@ def merge_pdfs_endpoint():
     file_ids: List[str] = data.get("fileIds") or []
     folder_id = data.get("folderId")
     output_name = data.get("outputName", "merged.pdf")
-    access_token = data.get("accessToken")
+    access_token = _get_access_token(data)
 
     if not (file_ids and folder_id and access_token):
-        return jsonify({"ok": False, "error": "fileIds, folderId, accessToken required"}), 400
+        return jsonify({"ok": False, "error": "fileIds, folderId, and access token (header or body) required"}), 400
 
     try:
         writer = PdfWriter()
