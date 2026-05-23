@@ -277,24 +277,47 @@ def extract_endpoint():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+def _image_to_pdf_pages(blob: bytes) -> PdfReader:
+    """Convert a JPG/PNG image blob to a single-page PDF (returned as PdfReader)."""
+    from PIL import Image
+    img = Image.open(io.BytesIO(blob))
+    if img.mode in ("RGBA", "P", "LA"):
+        img = img.convert("RGB")
+    pdf_buf = io.BytesIO()
+    img.save(pdf_buf, format="PDF", resolution=150.0)
+    pdf_buf.seek(0)
+    return PdfReader(pdf_buf)
+
+
 @app.post("/merge-pdfs")
 def merge_pdfs_endpoint():
     """
-    Merge multiple PDFs from Drive into a single PDF with page labels.
+    Merge multiple PDFs / images from Drive into a single PDF with page labels.
 
     Request body (JSON):
         {
-          "fileIds":     ["id1", "id2", ...],     # PDFs to merge in order
+          "fileIds":     ["id1", "id2", ...],   # files (PDF/JPG/PNG) in order
+          "labels":      ["PV20260400001", ...] # optional: bookmark per file
+                                                # (same length as fileIds; falls back to filename)
           "folderId":    "<Drive folder ID>",
           "outputName":  "merged.pdf",
           "accessToken": "<OAuth token>"
         }
 
     Response:
-        { "ok": true, "merged": {...drive metadata...} }
+        {
+          "ok": true,
+          "merged": {...drive metadata...},
+          "startPages": [
+            { "fileId": "...", "label": "PV20260400001", "page": 1, "pageCount": 3 },
+            { "fileId": "...", "label": "PV20260400002", "page": 4, "pageCount": 2 },
+            ...
+          ]
+        }
     """
     data = request.get_json(force=True, silent=True) or {}
     file_ids: List[str] = data.get("fileIds") or []
+    labels: List[str] = data.get("labels") or []
     folder_id = data.get("folderId")
     output_name = data.get("outputName", "merged.pdf")
     access_token = _get_access_token(data)
@@ -304,19 +327,47 @@ def merge_pdfs_endpoint():
 
     try:
         writer = PdfWriter()
-        for fid in file_ids:
+        start_pages = []
+
+        for idx, fid in enumerate(file_ids):
             blob = drive_download(fid, access_token)
-            reader = PdfReader(io.BytesIO(blob))
             meta = drive_get_metadata(fid, access_token)
-            label_base = meta.get("name", fid).rsplit(".", 1)[0]
-            for i, page in enumerate(reader.pages):
+            name = meta.get("name", fid)
+            mime = meta.get("mimeType", "")
+            label = labels[idx] if idx < len(labels) and labels[idx] else name.rsplit(".", 1)[0]
+
+            # Convert images to a PDF page; otherwise read as PDF directly
+            if mime.startswith("image/") or name.lower().endswith((".jpg", ".jpeg", ".png", ".gif")):
+                try:
+                    reader = _image_to_pdf_pages(blob)
+                except Exception as e:
+                    log.warning("Could not convert image %s to PDF: %s — skipping", name, e)
+                    continue
+            else:
+                try:
+                    reader = PdfReader(io.BytesIO(blob))
+                except Exception as e:
+                    log.warning("Could not read PDF %s: %s — skipping", name, e)
+                    continue
+
+            # First page of this source = start page in merged PDF (1-indexed)
+            page_count = len(reader.pages)
+            start_page = len(writer.pages) + 1
+            for page in reader.pages:
                 writer.add_page(page)
-                # add bookmark per source PDF (first page only)
-                if i == 0:
-                    try:
-                        writer.add_outline_item(label_base, len(writer.pages) - 1)
-                    except Exception:
-                        pass
+
+            try:
+                writer.add_outline_item(label, start_page - 1)  # 0-indexed for outline
+            except Exception:
+                pass
+
+            start_pages.append({
+                "fileId": fid,
+                "label": label,
+                "page": start_page,
+                "pageCount": page_count,
+                "sourceName": name,
+            })
 
         out_buf = io.BytesIO()
         writer.write(out_buf)
@@ -329,7 +380,11 @@ def merge_pdfs_endpoint():
             access_token=access_token,
             mime_type="application/pdf",
         )
-        return jsonify({"ok": True, "merged": uploaded})
+        return jsonify({
+            "ok": True,
+            "merged": uploaded,
+            "startPages": start_pages,
+        })
 
     except Exception as e:
         log.exception("Merge failed")
